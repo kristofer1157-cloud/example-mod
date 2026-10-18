@@ -1,100 +1,84 @@
-/**
- * Include the Geode headers.
- */
+// Mod experimental: búfer de input por ticks (GD 2.2, 240 TPS).
+// Sin compilar (no había SDK en mi entorno). Si algo no compila, copia el error.
 #include <Geode/Geode.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/CCKeyboardDispatcher.hpp>
+#include <chrono>
+#include <vector>
+#include <algorithm>
+#include <cmath>
 
-/**
- * Brings cocos2d and all Geode namespaces to the current scope.
- */
 using namespace geode::prelude;
+using Clock = std::chrono::steady_clock;
 
-/**
- * `$modify` lets you extend and modify GD's classes.
- * To hook a function in Geode, simply $modify the class
- * and write a new function definition with the signature of
- * the function you want to hook.
- *
- * Here we use the overloaded `$modify` macro to set our own class name,
- * so that we can use it for button callbacks.
- *
- * Notice the header being included, you *must* include the header for
- * the class you are modifying, or you will get a compile error.
- *
- * Another way you could do this is like this:
- *
- * struct MyMenuLayer : Modify<MyMenuLayer, MenuLayer> {};
- */
-#include <Geode/modify/MenuLayer.hpp>
-class $modify(MyMenuLayer, MenuLayer) {
-	/**
-	 * Typically classes in GD are initialized using the `init` function, (though not always!),
-	 * so here we use it to add our own button to the bottom menu.
-	 *
-	 * Note that for all hooks, your signature has to *match exactly*,
-	 * `void init()` would not place a hook!
-	*/
-	bool init() {
-		/**
-		 * We call the original init function so that the
-		 * original class is properly initialized.
-		 */
-		if (!MenuLayer::init()) {
-			return false;
-		}
+constexpr float TICK = 1.f / 240.f;
 
-		/**
-		 * You can use methods from the `geode::log` namespace to log messages to the console,
-		 * being useful for debugging and such. See this page for more info about logging:
-		 * https://docs.geode-sdk.org/tutorials/logging
-		*/
-		log::debug("Hello from my MenuLayer::init hook! This layer has {} children.", this->getChildrenCount());
+struct Stage { int all; int wave; };
+constexpr Stage STAGES[4] = { {2, 2}, {4, 4}, {8, 8}, {16, 8} };
+static int g_stage = 0; // 0..3 etapas, 4 = OFF
 
-		/**
-		 * See this page for more info about buttons
-		 * https://docs.geode-sdk.org/tutorials/buttons
-		*/
-		auto myButton = CCMenuItemSpriteExtra::create(
-			CCSprite::createWithSpriteFrameName("GJ_likeBtn_001.png"),
-			this,
-			/**
-			 * Here we use the name we set earlier for our modify class.
-			*/
-			menu_selector(MyMenuLayer::onMyButton)
-		);
+struct Pending { int button; bool down; bool p1; Clock::time_point t; };
+static std::vector<Pending> g_pending;
+static Clock::time_point g_prevFrame = Clock::now();
 
-		/**
-		 * Here we access the `bottom-menu` node by its ID, and add our button to it.
-		 * Node IDs are a Geode feature, see this page for more info about it:
-		 * https://docs.geode-sdk.org/tutorials/nodetree
-		*/
-		auto menu = this->getChildByID("bottom-menu");
-		menu->addChild(myButton);
+class $modify(TickLayer, GJBaseGameLayer) {
+    // Guardamos el click con su hora real en vez de dejar que el juego lo aplique al inicio del frame.
+    void queueButton(int button, bool down, bool p1) {
+        if (g_stage >= 4 || !PlayLayer::get()) {
+            GJBaseGameLayer::queueButton(button, down, p1);
+            return;
+        }
+        g_pending.push_back({ button, down, p1, Clock::now() });
+    }
 
-		/**
-		 * The `_spr` string literal operator just prefixes the string with
-		 * your mod id followed by a slash. This is good practice for setting your own node ids.
-		*/
-		myButton->setID("my-button"_spr);
+    // Partimos el frame en tramos de ticks y aplicamos cada input en su tick.
+    void processCommands(float dt) {
+        auto prev = g_prevFrame;
+        g_prevFrame = Clock::now();
 
-		/**
-		 * We update the layout of the menu to ensure that our button is properly placed.
-		 * This is yet another Geode feature, see this page for more info about it:
-		 * https://docs.geode-sdk.org/tutorials/layouts
-		*/
-		menu->updateLayout();
+        if (g_pending.empty() || g_stage >= 4) {
+            GJBaseGameLayer::processCommands(dt);
+            return;
+        }
 
-		/**
-		 * We return `true` to indicate that the class was properly initialized.
-		 */
-		return true;
-	}
+        int total = std::max(1, (int)std::round(dt / TICK));
+        bool wave = m_player1 && m_player1->m_isDart;
+        int limit = wave ? STAGES[g_stage].wave : STAGES[g_stage].all;
 
-	/**
-	 * This is the callback function for the button we created earlier.
-	 * The signature for button callbacks must always be the same,
-	 * return type `void` and taking a `CCObject*`.
-	*/
-	void onMyButton(CCObject*) {
-		FLAlertLayer::create("Geode", "Hello from my custom mod!", "OK")->show();
-	}
+        struct Item { Pending in; int tick; };
+        std::vector<Item> items;
+        for (auto& in : g_pending) {
+            float since = std::chrono::duration<float>(in.t - prev).count();
+            int k = std::clamp((int)(since / TICK), 0, total);
+            int tick = std::min(k, limit);
+            items.push_back({ in, tick });
+            log::info("SAVED +{} TICKS ({:.2f} frames @60fps) {} [Limit: {}]",
+                tick, tick * 0.25f, in.down ? "PRESS!" : "RELEASE!", limit);
+        }
+        g_pending.clear();
+        std::stable_sort(items.begin(), items.end(),
+            [](auto& a, auto& b) { return a.tick < b.tick; });
+
+        int cursor = 0;
+        for (auto& it : items) {
+            if (it.tick > cursor) {
+                GJBaseGameLayer::processCommands((it.tick - cursor) * TICK);
+                cursor = it.tick;
+            }
+            GJBaseGameLayer::queueButton(it.in.button, it.in.down, it.in.p1);
+        }
+        GJBaseGameLayer::processCommands(std::max(total - cursor, 1) * TICK);
+    }
+};
+
+class $modify(CCKeyboardDispatcher) {
+    bool dispatchKeyboardMSG(enumKeyCodes key, bool down, bool repeat) {
+        if (down && !repeat && key == KEY_F6) {
+            g_stage = (g_stage + 1) % 5;
+            if (g_stage == 4) log::info("F6 -> STAGE 5: OFF (100% raw input)");
+            else log::info("F6 -> STAGE {}: {} ticks all | {} ticks wave",
+                g_stage + 1, STAGES[g_stage].all, STAGES[g_stage].wave);
+        }
+        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, down, repeat);
+    }
 };
